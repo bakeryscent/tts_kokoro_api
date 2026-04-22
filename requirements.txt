@@ -1,0 +1,10 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.9.2
+kokoro==0.9.4
+soundfile==0.12.1
+numpy<2.0
+
+# Japanese + Mandarin phonemizer extras (pulls fugashi, unidic-lite, jaconv,
+# pyopenjtalk, cn2an, jieba, pypinyin, ordered-set, etc. transitively).
+misaki[ja,zh]==0.9.4
