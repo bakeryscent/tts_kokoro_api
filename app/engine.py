@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import hashlib
 import os
 import re
@@ -14,7 +15,10 @@ from kokoro import KPipeline
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAMPLE_RATE = 24000
 
-# FP16 inference on CUDA — ~1.5× faster on L4 with near-zero quality loss.
+# FP16 inference on CUDA via torch.autocast — ~1.5× faster with near-zero quality loss.
+# We use autocast (not model.half()) because Kokoro's G2P produces Float32 input
+# tensors; .half()'ing the model weights causes dtype mismatches at the embedding
+# layer. Autocast casts at op boundaries and handles this correctly.
 # Off by default on non-CUDA (CPU FP16 is often slower). Disable with KOKORO_FP16=0.
 USE_FP16 = DEVICE == "cuda" and os.environ.get("KOKORO_FP16", "1") != "0"
 
@@ -105,13 +109,14 @@ def _pipeline_for(voice: str) -> KPipeline:
         if pipe is not None:
             return pipe
         pipe = KPipeline(lang_code=lang, device=DEVICE)
-        if USE_FP16 and getattr(pipe, "model", None) is not None:
-            try:
-                pipe.model = pipe.model.half()
-            except Exception:
-                pass
         _pipelines[lang] = pipe
         return pipe
+
+
+def _inference_context():
+    if USE_FP16:
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return contextlib.nullcontext()
 
 
 def _float32_to_pcm16_base64(audio: np.ndarray) -> str:
@@ -189,17 +194,18 @@ def _synthesize_uncached(text: str, voice: str, speed: float, return_timestamps:
     chunks: List[np.ndarray] = []
     last_result: Any = None
 
-    for item in pipe(text, voice=voice, speed=float(speed), split_pattern=None):
-        last_result = item
-        if hasattr(item, "audio"):
-            audio = item.audio
-        elif isinstance(item, tuple) and len(item) >= 3:
-            audio = item[2]
-        else:
-            audio = item
-        if hasattr(audio, "detach"):
-            audio = audio.detach().to(torch.float32).cpu().numpy()
-        chunks.append(np.asarray(audio, dtype=np.float32))
+    with torch.inference_mode(), _inference_context():
+        for item in pipe(text, voice=voice, speed=float(speed), split_pattern=None):
+            last_result = item
+            if hasattr(item, "audio"):
+                audio = item.audio
+            elif isinstance(item, tuple) and len(item) >= 3:
+                audio = item[2]
+            else:
+                audio = item
+            if hasattr(audio, "detach"):
+                audio = audio.detach().to(torch.float32).cpu().numpy()
+            chunks.append(np.asarray(audio, dtype=np.float32))
 
     if not chunks:
         raise RuntimeError("Kokoro produced no audio")
