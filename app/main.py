@@ -8,16 +8,24 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
+from app import axiom_handler, phonemizer_patches
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',
+)
+# Ship structured logs to Axiom (no-op if AXIOM_TOKEN/AXIOM_DATASET unset).
+axiom_handler.install(service="kokoro-api")
+# Patch phonemizer BEFORE engine import — engine pulls in kokoro→misaki→
+# phonemizer. See phonemizer_patches.py for the May 2 2026 incident.
+phonemizer_patches.apply()
+
 from app.engine import SynthesisResult, get_stats, synthesize, warmup_all_languages
 
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()
 if not API_TOKEN:
     raise RuntimeError("API_TOKEN env var is required")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',
-)
 log = logging.getLogger("kokoro-api")
 
 bearer = HTTPBearer(auto_error=True)

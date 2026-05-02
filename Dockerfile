@@ -24,6 +24,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m unidic download
 
 COPY app/ ./app/
+COPY scripts/start_kokoro.sh ./scripts/start_kokoro.sh
+RUN chmod +x ./scripts/start_kokoro.sh
 
 # Pre-download Kokoro model + phonemizer assets for ALL 9 languages so
 # first request in any language is instant.
@@ -34,4 +36,6 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD curl -fsS http://localhost:8080/health || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--log-level", "info", "--timeout-keep-alive", "30"]
+# Supervisor restarts uvicorn on crash; logs ship to Axiom when AXIOM_TOKEN
+# and AXIOM_DATASET are set in the container env.
+CMD ["bash", "/app/scripts/start_kokoro.sh"]
