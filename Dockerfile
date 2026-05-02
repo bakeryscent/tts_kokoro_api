@@ -6,10 +6,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/app/.hf \
     TRANSFORMERS_CACHE=/app/.hf
 
+# build-essential + cmake are needed by misaki[ja,zh]'s C extensions
+# (pyopenjtalk, fugashi) which don't ship prebuilt wheels for every Python
+# / glibc combo and fall back to source builds.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       espeak-ng \
       libsndfile1 \
       curl \
+      build-essential \
+      cmake \
+      git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
