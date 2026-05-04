@@ -4,7 +4,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/app/.hf \
-    TRANSFORMERS_CACHE=/app/.hf
+    TRANSFORMERS_CACHE=/app/.hf \
+    # Cap glibc per-thread arenas (default ~8×CPU). Long-running Python ML
+    # inference fragments glibc heaps and leaks RSS without leaking Python
+    # objects. MALLOC_ARENA_MAX=2 + PYTHONMALLOC=malloc cut observed RSS
+    # growth from ~20 GiB/day to a manageable steady-state on the 47 GiB
+    # cgroup. MALLOC_TRIM_THRESHOLD_ encourages glibc to return freed pages
+    # to the OS instead of holding them in arena caches.
+    MALLOC_ARENA_MAX=2 \
+    MALLOC_TRIM_THRESHOLD_=131072 \
+    PYTHONMALLOC=malloc
 
 # build-essential + cmake are needed by misaki[ja,zh]'s C extensions
 # (pyopenjtalk, fugashi) which don't ship prebuilt wheels for every Python
