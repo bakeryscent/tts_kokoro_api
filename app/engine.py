@@ -66,6 +66,23 @@ class SynthesisResult:
 _pipelines: Dict[str, KPipeline] = {}
 _pipelines_lock = threading.Lock()
 
+# Serializes the kokoro pipe() call across all threads in this process.
+#
+# Why: espeak-ng's C library (used by misaki/phonemizer for G2P) is NOT
+# thread-safe. FastAPI runs sync `def` endpoints in a threadpool, so
+# concurrent requests race into the shared espeak state, manifesting as
+# `UnicodeDecodeError` on phoneme output (espeak returns a buffer with
+# invalid UTF-8 bytes — race-corrupted state). Repeated bad calls
+# accumulate enough corruption that espeak eventually calls abort() at
+# the C level and SIGABRTs the whole worker (observed 2026-05-05 10:01
+# UTC: 5 simultaneous synthesis_failed events at 09:58:29 → SIGABRT).
+#
+# Locking the whole pipe call also serializes GPU inference, but our
+# pod sits at <10% GPU utilization so the throughput cost is invisible.
+# We trade peak parallelism for stability — the right call until the
+# upstream phonemizer/espeak adds proper thread safety.
+_espeak_lock = threading.Lock()
+
 _cache: "OrderedDict[str, SynthesisResult]" = OrderedDict()
 _pending: Dict[str, threading.Event] = {}
 _cache_lock = threading.Lock()
@@ -194,7 +211,9 @@ def _synthesize_uncached(text: str, voice: str, speed: float, return_timestamps:
     chunks: List[np.ndarray] = []
     last_result: Any = None
 
-    with torch.inference_mode(), _inference_context():
+    # _espeak_lock: see top of file. Serializes all kokoro inference across
+    # threads in this process to prevent espeak-ng C-state corruption.
+    with _espeak_lock, torch.inference_mode(), _inference_context():
         for item in pipe(text, voice=voice, speed=float(speed), split_pattern=None):
             last_result = item
             if hasattr(item, "audio"):

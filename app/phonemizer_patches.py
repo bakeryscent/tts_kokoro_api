@@ -50,11 +50,19 @@ _safe_mismatched_lines._kokoro_api_safe_patch = True  # type: ignore[attr-define
 
 
 def apply() -> bool:
-    """Install the patch. Idempotent. Returns True if newly applied."""
+    """Install all phonemizer hardening patches. Idempotent. Returns True
+    if any new patch was applied."""
+    applied = False
+    applied = _apply_words_mismatch_patch() or applied
+    applied = _apply_text_to_phonemes_patch() or applied
+    return applied
+
+
+def _apply_words_mismatch_patch() -> bool:
     try:
         from phonemizer.backend.espeak import words_mismatch
     except ImportError:
-        _log.warning("phonemizer not importable; skipping patch")
+        _log.warning("phonemizer not importable; skipping words_mismatch patch")
         return False
 
     cls = words_mismatch.BaseWordsMismatch
@@ -64,4 +72,53 @@ def apply() -> bool:
 
     cls._mismatched_lines = _safe_mismatched_lines  # type: ignore[assignment]
     _log.info("patched phonemizer BaseWordsMismatch._mismatched_lines (no-raise)")
+    return True
+
+
+def _apply_text_to_phonemes_patch() -> bool:
+    """Patch `EspeakWrapper.text_to_phonemes` to swallow UnicodeDecodeError.
+
+    Background. espeak-ng's C library occasionally returns a phoneme buffer
+    with invalid UTF-8 bytes — observed on 2026-05-05 as `'utf-8' codec can't
+    decode byte 0xfa in position 3`. The standard cause is concurrent access
+    racing the shared C state (espeak isn't thread-safe). We've also added a
+    process-level lock in engine.py to prevent the race; this patch is a
+    defensive fallback for any code path the lock doesn't cover.
+
+    Without this patch the UnicodeDecodeError propagates as HTTP 500, and
+    enough back-to-back failures push espeak into a state where it calls
+    abort() at the C level (SIGABRT, exit 134). With it we log the bad
+    line, return an empty result for that fragment, and let the rest of
+    the synthesis continue.
+    """
+    try:
+        from phonemizer.backend.espeak import wrapper as _wrapper
+    except ImportError:
+        _log.warning("phonemizer wrapper not importable; skipping text_to_phonemes patch")
+        return False
+
+    cls = _wrapper.EspeakWrapper
+    current = cls.text_to_phonemes
+    if getattr(current, _PATCH_MARKER, False):
+        return False
+
+    def _safe_text_to_phonemes(self, text, tie):
+        try:
+            return current(self, text, tie)
+        except UnicodeDecodeError as e:
+            _log.warning(
+                "espeak text_to_phonemes UnicodeDecodeError suppressed (text=%r tie=%r): %s",
+                text[:80] if isinstance(text, str) else "<non-str>",
+                tie,
+                str(e)[:160],
+            )
+            # Return empty string — upstream `_phonemize_aux` builds a list
+            # of these and joins them. An empty fragment loses that line's
+            # phonemes (silent / wrong audio for that bit) but keeps the
+            # rest of the request alive instead of cascading to SIGABRT.
+            return ""
+
+    _safe_text_to_phonemes._kokoro_api_safe_patch = True  # type: ignore[attr-defined]
+    cls.text_to_phonemes = _safe_text_to_phonemes  # type: ignore[assignment]
+    _log.info("patched phonemizer EspeakWrapper.text_to_phonemes (no-raise on UnicodeDecodeError)")
     return True
