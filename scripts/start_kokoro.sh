@@ -42,6 +42,18 @@ MEM_RESTART_PCT=${KOKORO_MEM_RESTART_PCT:-85}
 MEM_CHECK_INTERVAL=${KOKORO_MEM_CHECK_INTERVAL:-30}
 MEM_STARTUP_GRACE=${KOKORO_MEM_STARTUP_GRACE:-180}  # skip checks during warmup (~120s)
 
+# Proactive daily restart. The kokoro process leaks ~9 GiB/day, so left alone
+# it hits the memory ceiling every ~3 days AT A RANDOM HOUR — on 2026-08-27
+# that meant 2.5h of timeouts during a US-evening peak, with all traffic
+# falling back to DeepInfra exactly when DeepInfra is busiest (its 429s cluster
+# 17:00-01:00 UTC). Restarting on our own schedule, in the calmest window,
+# turns that into a ~2 min blip nobody notices.
+# Set KOKORO_DAILY_RESTART_UTC_HOUR to an hour (0-23) to enable; empty = off.
+DAILY_RESTART_HOUR=${KOKORO_DAILY_RESTART_UTC_HOUR:-}
+# Never restart a child younger than this — guards against a restart loop
+# inside the target hour (the process would otherwise be killed every check).
+DAILY_RESTART_MIN_UPTIME=${KOKORO_DAILY_RESTART_MIN_UPTIME:-21600}  # 6h
+
 # Pick uvicorn: prefer venv binary if present, otherwise rely on PATH.
 if [ -x "$PROJ/.venv/bin/uvicorn" ]; then
     UVICORN="$PROJ/.venv/bin/uvicorn"
@@ -75,11 +87,24 @@ ship_axiom() {
         "https://api.axiom.co/v1/datasets/$AXIOM_DATASET/ingest" >/dev/null 2>&1 || true
 }
 
-# Memory watchdog: read cgroup current/limit, kill child if usage exceeds
-# threshold. Skips checks during the warmup grace period so model loading
-# doesn't trip a false positive on first start.
+# Graceful stop: SIGTERM, 10s to drain in-flight requests, then SIGKILL.
+terminate_child() {
+    local pid=$1
+    kill -TERM "$pid" 2>/dev/null || true
+    local i=0
+    while [ $i -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        i=$((i + 1))
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+# Supervision loop for a running child: memory watchdog (kill above the cgroup
+# threshold) plus the optional proactive daily restart. Skips checks during the
+# warmup grace period so model loading doesn't trip a false positive.
 mem_watchdog() {
     local pid=$1
+    local started_at=$(date +%s)
     local limit_path current_path limit
     if [ -f /sys/fs/cgroup/memory.max ]; then
         limit_path=/sys/fs/cgroup/memory.max
@@ -88,35 +113,63 @@ mem_watchdog() {
         limit_path=/sys/fs/cgroup/memory/memory.limit_in_bytes
         current_path=/sys/fs/cgroup/memory/memory.usage_in_bytes
     else
-        echo "[watchdog] no cgroup memory files found, watchdog disabled"
-        return
+        echo "[watchdog] no cgroup memory files found, memory watchdog disabled"
+        limit_path=""
+        current_path=""
     fi
-    limit=$(cat "$limit_path" 2>/dev/null || echo 0)
+    limit=0
+    if [ -n "$limit_path" ]; then
+        limit=$(cat "$limit_path" 2>/dev/null || echo 0)
+    fi
     if [ "$limit" = "max" ] || [ -z "$limit" ] || [ "$limit" = "0" ]; then
-        echo "[watchdog] no cgroup memory limit set ($limit_path = $limit), watchdog disabled"
-        return
+        echo "[watchdog] no cgroup memory limit set (${limit_path:-none} = ${limit}), memory watchdog disabled"
+        limit=0
     fi
-    local threshold=$((limit * MEM_RESTART_PCT / 100))
-    echo "[watchdog] active: limit=${limit}B threshold=${threshold}B (${MEM_RESTART_PCT}%) interval=${MEM_CHECK_INTERVAL}s grace=${MEM_STARTUP_GRACE}s"
+    # Normalize the configured hour once, forcing base 10: "08"/"09" would be
+    # parsed as invalid octal by printf/arithmetic. Invalid values disable it.
+    local target_h=""
+    if [ -n "$DAILY_RESTART_HOUR" ]; then
+        if target_h=$(printf '%02d' "$((10#$DAILY_RESTART_HOUR))" 2>/dev/null) &&
+           [ "$((10#$DAILY_RESTART_HOUR))" -ge 0 ] &&
+           [ "$((10#$DAILY_RESTART_HOUR))" -le 23 ]; then
+            :
+        else
+            echo "[watchdog] invalid KOKORO_DAILY_RESTART_UTC_HOUR='$DAILY_RESTART_HOUR', daily restart disabled"
+            target_h=""
+        fi
+    fi
+
+    local threshold=0
+    [ "$limit" != "0" ] && threshold=$((limit * MEM_RESTART_PCT / 100))
+    echo "[watchdog] active: limit=${limit}B threshold=${threshold}B (${MEM_RESTART_PCT}%) interval=${MEM_CHECK_INTERVAL}s grace=${MEM_STARTUP_GRACE}s daily_restart_utc_hour=${target_h:-off}"
 
     sleep "$MEM_STARTUP_GRACE"
 
     while kill -0 "$pid" 2>/dev/null; do
+        # Proactive daily restart, in the quiet window, before the leak forces
+        # an uncontrolled one at a bad hour.
+        if [ -n "$target_h" ]; then
+            local now_h uptime_s
+            now_h=$(date -u +%H)
+            uptime_s=$(( $(date +%s) - started_at ))
+            if [ "$now_h" = "$target_h" ] &&
+               [ "$uptime_s" -ge "$DAILY_RESTART_MIN_UPTIME" ]; then
+                echo "[watchdog] ⏰ daily restart window (${now_h}:00 UTC, uptime ${uptime_s}s) — terminating uvicorn pid=$pid"
+                ship_axiom "watchdog.daily_restart" "INFO" \
+                    "\"uptime_s\":$uptime_s,\"hour_utc\":\"$now_h\",\"pid\":$pid"
+                terminate_child "$pid"
+                return
+            fi
+        fi
+
         local current
         current=$(cat "$current_path" 2>/dev/null || echo 0)
-        if [ "$current" -gt "$threshold" ] 2>/dev/null; then
+        if [ "$threshold" != "0" ] && [ "$current" -gt "$threshold" ] 2>/dev/null; then
             local pct=$((current * 100 / limit))
             echo "[watchdog] 🚨 RSS ${current}B / ${limit}B = ${pct}% > ${MEM_RESTART_PCT}% — terminating uvicorn pid=$pid"
             ship_axiom "watchdog.memory_restart" "WARN" \
                 "\"rss_bytes\":$current,\"limit_bytes\":$limit,\"pct\":$pct,\"threshold_pct\":$MEM_RESTART_PCT,\"pid\":$pid"
-            kill -TERM "$pid" 2>/dev/null || true
-            # Give uvicorn 10s to drain in-flight requests, then SIGKILL.
-            local i=0
-            while [ $i -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
-                sleep 1
-                i=$((i + 1))
-            done
-            kill -KILL "$pid" 2>/dev/null || true
+            terminate_child "$pid"
             return
         fi
         sleep "$MEM_CHECK_INTERVAL"
