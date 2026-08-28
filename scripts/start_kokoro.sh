@@ -48,11 +48,16 @@ MEM_STARTUP_GRACE=${KOKORO_MEM_STARTUP_GRACE:-180}  # skip checks during warmup 
 # falling back to DeepInfra exactly when DeepInfra is busiest (its 429s cluster
 # 17:00-01:00 UTC). Restarting on our own schedule, in the calmest window,
 # turns that into a ~2 min blip nobody notices.
-# Set KOKORO_DAILY_RESTART_UTC_HOUR to an hour (0-23) to enable; empty = off.
+# Measured 2026-08-28: baseline ~24 GiB after warmup, leak ~1 GiB/h under
+# production traffic, cgroup cap 46.6 GiB → only ~15h of runway before the 85%
+# threshold. One restart a day is NOT enough; two, spaced ~12h and both inside
+# the calm band, keep it well clear and never surprise us at a bad hour.
+# KOKORO_DAILY_RESTART_UTC_HOUR takes one hour or a comma-separated list
+# (e.g. "04,16"); empty = off.
 DAILY_RESTART_HOUR=${KOKORO_DAILY_RESTART_UTC_HOUR:-}
 # Never restart a child younger than this — guards against a restart loop
-# inside the target hour (the process would otherwise be killed every check).
-DAILY_RESTART_MIN_UPTIME=${KOKORO_DAILY_RESTART_MIN_UPTIME:-21600}  # 6h
+# inside a target hour. Must be shorter than the gap between windows.
+DAILY_RESTART_MIN_UPTIME=${KOKORO_DAILY_RESTART_MIN_UPTIME:-14400}  # 4h
 
 # Pick uvicorn: prefer venv binary if present, otherwise rely on PATH.
 if [ -x "$PROJ/.venv/bin/uvicorn" ]; then
@@ -125,34 +130,37 @@ mem_watchdog() {
         echo "[watchdog] no cgroup memory limit set (${limit_path:-none} = ${limit}), memory watchdog disabled"
         limit=0
     fi
-    # Normalize the configured hour once, forcing base 10: "08"/"09" would be
-    # parsed as invalid octal by printf/arithmetic. Invalid values disable it.
-    local target_h=""
+    # Normalize the configured hour(s) once into a " 04 16 " lookup string,
+    # forcing base 10: "08"/"09" would be parsed as invalid octal by
+    # printf/arithmetic. Invalid entries are dropped with a warning.
+    local target_hours=""
     if [ -n "$DAILY_RESTART_HOUR" ]; then
-        if target_h=$(printf '%02d' "$((10#$DAILY_RESTART_HOUR))" 2>/dev/null) &&
-           [ "$((10#$DAILY_RESTART_HOUR))" -ge 0 ] &&
-           [ "$((10#$DAILY_RESTART_HOUR))" -le 23 ]; then
-            :
-        else
-            echo "[watchdog] invalid KOKORO_DAILY_RESTART_UTC_HOUR='$DAILY_RESTART_HOUR', daily restart disabled"
-            target_h=""
-        fi
+        local raw h n
+        for raw in ${DAILY_RESTART_HOUR//,/ }; do
+            if n=$((10#$raw)) 2>/dev/null && [ "$n" -ge 0 ] && [ "$n" -le 23 ]; then
+                h=$(printf '%02d' "$n")
+                target_hours="${target_hours}${h} "
+            else
+                echo "[watchdog] ignoring invalid restart hour '$raw'"
+            fi
+        done
+        [ -n "$target_hours" ] && target_hours=" ${target_hours}"
     fi
 
     local threshold=0
     [ "$limit" != "0" ] && threshold=$((limit * MEM_RESTART_PCT / 100))
-    echo "[watchdog] active: limit=${limit}B threshold=${threshold}B (${MEM_RESTART_PCT}%) interval=${MEM_CHECK_INTERVAL}s grace=${MEM_STARTUP_GRACE}s daily_restart_utc_hour=${target_h:-off}"
+    echo "[watchdog] active: limit=${limit}B threshold=${threshold}B (${MEM_RESTART_PCT}%) interval=${MEM_CHECK_INTERVAL}s grace=${MEM_STARTUP_GRACE}s daily_restart_utc_hours=${target_hours:-off}"
 
     sleep "$MEM_STARTUP_GRACE"
 
     while kill -0 "$pid" 2>/dev/null; do
         # Proactive daily restart, in the quiet window, before the leak forces
         # an uncontrolled one at a bad hour.
-        if [ -n "$target_h" ]; then
+        if [ -n "$target_hours" ]; then
             local now_h uptime_s
             now_h=$(date -u +%H)
             uptime_s=$(( $(date +%s) - started_at ))
-            if [ "$now_h" = "$target_h" ] &&
+            if [ "${target_hours#* $now_h}" != "$target_hours" ] &&
                [ "$uptime_s" -ge "$DAILY_RESTART_MIN_UPTIME" ]; then
                 echo "[watchdog] ⏰ daily restart window (${now_h}:00 UTC, uptime ${uptime_s}s) — terminating uvicorn pid=$pid"
                 ship_axiom "watchdog.daily_restart" "INFO" \
