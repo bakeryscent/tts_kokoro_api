@@ -55,9 +55,50 @@ MEM_STARTUP_GRACE=${KOKORO_MEM_STARTUP_GRACE:-180}  # skip checks during warmup 
 # KOKORO_DAILY_RESTART_UTC_HOUR takes one hour or a comma-separated list
 # (e.g. "04,16"); empty = off.
 DAILY_RESTART_HOUR=${KOKORO_DAILY_RESTART_UTC_HOUR:-}
-# Never restart a child younger than this — guards against a restart loop
-# inside a target hour. Must be shorter than the gap between windows.
-DAILY_RESTART_MIN_UPTIME=${KOKORO_DAILY_RESTART_MIN_UPTIME:-14400}  # 4h
+# Never restart a child younger than this. Its ONLY job is to stop a restart
+# loop inside a target hour; the "one restart per window" marker below is what
+# actually enforces once-per-window, so this can be short.
+#
+# It used to be 4h, and that silently disabled the scheduled restart entirely
+# (2026-09-06). The memory watchdog now fires more than once a day, and it
+# happened to land at ~03:45 — minutes before the 04:00 window. Every scheduled
+# restart therefore saw a child a few minutes old and skipped it, so 04:00 had
+# not fired since 31 August; on 6 September a second memory kill at 14:11 took
+# out the 16:00 window too. The emergency restart was crowding out the planned
+# one, which is exactly backwards: the planned restart exists to prevent the
+# emergency.
+DAILY_RESTART_MIN_UPTIME=${KOKORO_DAILY_RESTART_MIN_UPTIME:-600}  # 10 min
+
+# HARD CAP on child age, and the real guarantee here: unlike a clock window it
+# cannot be skipped, crowded out or drifted past, because it depends on nothing
+# but the child's own age. With the leak at ~1-1.5 GiB/h over a ~22 GiB
+# baseline and an 85% threshold on a 46 GiB cgroup, 8h holds RSS around 34 GiB
+# (~73%) and the memory watchdog should never fire again in normal operation —
+# it goes back to being the safety net it was meant to be. Deliberately LONGER
+# than the spacing of the scheduled windows (6h), so in steady state the window
+# is what restarts us, at a predictable hour, and this only takes over when a
+# window is missed.
+#
+# Why this matters more than it used to: between 24 and 28 August the router
+# was flipped and the pod went from roughly half the synthesis traffic to
+# 99.4% of it. DeepInfra now serves ~700 requests/day, so the fallback that
+# used to absorb these events is no longer sized for them — at the ~70k/day it
+# handled in early August it was answering "429 Model busy" (54 failed exports
+# between 3 and 18 August). An uncontrolled kill at peak is now far more
+# expensive than four planned ~2 min blips.
+# 0 disables.
+MAX_UPTIME=${KOKORO_MAX_UPTIME:-28800}  # 8h
+
+# How long uvicorn gets to finish in-flight requests after SIGTERM. A single
+# synthesis can run ~25s (measured: one 24.65s request), so the previous
+# hardcoded 10s cut long generations off mid-flight and turned a planned
+# restart into client-visible timeouts.
+DRAIN_TIMEOUT=${KOKORO_DRAIN_TIMEOUT:-45}
+
+# Remembers the last scheduled window we acted on ("YYYY-MM-DDTHH"), so a
+# window fires exactly once even across child restarts. Survives in the log
+# dir, which outlives any individual uvicorn process.
+WINDOW_MARKER=$LOG_DIR/.last_scheduled_restart
 
 # Pick uvicorn: prefer venv binary if present, otherwise rely on PATH.
 if [ -x "$PROJ/.venv/bin/uvicorn" ]; then
@@ -92,16 +133,38 @@ ship_axiom() {
         "https://api.axiom.co/v1/datasets/$AXIOM_DATASET/ingest" >/dev/null 2>&1 || true
 }
 
-# Graceful stop: SIGTERM, 10s to drain in-flight requests, then SIGKILL.
+# Graceful stop: SIGTERM, then up to DRAIN_TIMEOUT seconds for uvicorn to
+# finish what it is already serving before SIGKILL. Uvicorn stops accepting new
+# connections as soon as it gets the TERM, so callers fail over to DeepInfra
+# immediately while in-flight generations are allowed to complete.
 terminate_child() {
     local pid=$1
     kill -TERM "$pid" 2>/dev/null || true
     local i=0
-    while [ $i -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+    while [ "$i" -lt "$DRAIN_TIMEOUT" ] && kill -0 "$pid" 2>/dev/null; do
         sleep 1
         i=$((i + 1))
     done
-    kill -KILL "$pid" 2>/dev/null || true
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "[supervisor] pid=$pid still alive after ${DRAIN_TIMEOUT}s drain — SIGKILL"
+        ship_axiom "watchdog.drain_timeout" "WARN" \
+            "\"drain_timeout_s\":$DRAIN_TIMEOUT,\"pid\":$pid"
+        kill -KILL "$pid" 2>/dev/null || true
+    else
+        echo "[supervisor] pid=$pid drained in ${i}s"
+    fi
+}
+
+# If we are restarting for ANY reason while inside a scheduled window, claim
+# that window. Without this, a max-uptime or memory restart at 10:02 would be
+# followed by the 10:00 window firing again ~10 minutes later: two restarts
+# where one was wanted.
+stamp_window_if_target() {
+    [ -n "${target_hours:-}" ] || return 0
+    local now_h
+    now_h=$(date -u +%H)
+    [ "${target_hours#* $now_h}" != "$target_hours" ] || return 0
+    date -u +%Y-%m-%dT%H > "$WINDOW_MARKER" 2>/dev/null || true
 }
 
 # Supervision loop for a running child: memory watchdog (kill above the cgroup
@@ -149,20 +212,41 @@ mem_watchdog() {
 
     local threshold=0
     [ "$limit" != "0" ] && threshold=$((limit * MEM_RESTART_PCT / 100))
-    echo "[watchdog] active: limit=${limit}B threshold=${threshold}B (${MEM_RESTART_PCT}%) interval=${MEM_CHECK_INTERVAL}s grace=${MEM_STARTUP_GRACE}s daily_restart_utc_hours=${target_hours:-off}"
+    echo "[watchdog] active: limit=${limit}B threshold=${threshold}B (${MEM_RESTART_PCT}%) interval=${MEM_CHECK_INTERVAL}s grace=${MEM_STARTUP_GRACE}s scheduled_utc_hours=${target_hours:-off} max_uptime=${MAX_UPTIME}s drain=${DRAIN_TIMEOUT}s"
 
     sleep "$MEM_STARTUP_GRACE"
 
     while kill -0 "$pid" 2>/dev/null; do
-        # Proactive daily restart, in the quiet window, before the leak forces
-        # an uncontrolled one at a bad hour.
+        local uptime_s
+        uptime_s=$(( $(date +%s) - started_at ))
+
+        # Hard age cap. Checked FIRST and deliberately unconditional: this is
+        # the one restart nothing can skip, so the memory ceiling is never
+        # reached in normal operation.
+        if [ "$MAX_UPTIME" -gt 0 ] && [ "$uptime_s" -ge "$MAX_UPTIME" ]; then
+            stamp_window_if_target
+            echo "[watchdog] ⏳ max uptime reached (${uptime_s}s >= ${MAX_UPTIME}s) — terminating uvicorn pid=$pid"
+            ship_axiom "watchdog.max_uptime_restart" "INFO" \
+                "\"uptime_s\":$uptime_s,\"max_uptime_s\":$MAX_UPTIME,\"pid\":$pid"
+            terminate_child "$pid"
+            return
+        fi
+
+        # Preferred restart windows, so the blip lands in a calm hour rather
+        # than wherever the age cap happens to fall. The marker file makes a
+        # window fire once per calendar hour ACROSS children — the min-uptime
+        # check alone used to be the loop guard, and that is what let an
+        # unrelated memory kill swallow the whole window.
         if [ -n "$target_hours" ]; then
-            local now_h uptime_s
+            local now_h now_window last_window
             now_h=$(date -u +%H)
-            uptime_s=$(( $(date +%s) - started_at ))
+            now_window=$(date -u +%Y-%m-%dT%H)
+            last_window=$(cat "$WINDOW_MARKER" 2>/dev/null || echo "")
             if [ "${target_hours#* $now_h}" != "$target_hours" ] &&
-               [ "$uptime_s" -ge "$DAILY_RESTART_MIN_UPTIME" ]; then
-                echo "[watchdog] ⏰ daily restart window (${now_h}:00 UTC, uptime ${uptime_s}s) — terminating uvicorn pid=$pid"
+               [ "$uptime_s" -ge "$DAILY_RESTART_MIN_UPTIME" ] &&
+               [ "$last_window" != "$now_window" ]; then
+                echo "$now_window" > "$WINDOW_MARKER" 2>/dev/null || true
+                echo "[watchdog] ⏰ scheduled restart window (${now_h}:00 UTC, uptime ${uptime_s}s) — terminating uvicorn pid=$pid"
                 ship_axiom "watchdog.daily_restart" "INFO" \
                     "\"uptime_s\":$uptime_s,\"hour_utc\":\"$now_h\",\"pid\":$pid"
                 terminate_child "$pid"
@@ -174,6 +258,7 @@ mem_watchdog() {
         current=$(cat "$current_path" 2>/dev/null || echo 0)
         if [ "$threshold" != "0" ] && [ "$current" -gt "$threshold" ] 2>/dev/null; then
             local pct=$((current * 100 / limit))
+            stamp_window_if_target
             echo "[watchdog] 🚨 RSS ${current}B / ${limit}B = ${pct}% > ${MEM_RESTART_PCT}% — terminating uvicorn pid=$pid"
             ship_axiom "watchdog.memory_restart" "WARN" \
                 "\"rss_bytes\":$current,\"limit_bytes\":$limit,\"pct\":$pct,\"threshold_pct\":$MEM_RESTART_PCT,\"pid\":$pid"
